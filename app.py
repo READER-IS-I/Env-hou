@@ -1,82 +1,148 @@
-import os
-from flask_cors import CORS
-from flask import Flask, jsonify, request, send_file, Response
+import json
+import tempfile
+import uuid
+import zipfile
+from pathlib import Path
+
+import geopandas as gpd
 from celery import Celery
-from tiler import TilerService
+from flask import Flask, Response, jsonify, request
+from flask_cors import CORS
+
 import tasks
+from tiler import TilerService
+
+
+BASE_DATA_DIR = Path("data")
+AOI_DIR = BASE_DATA_DIR / "aoi"
+COG_DIR = BASE_DATA_DIR / "cog"
 
 app = Flask(__name__)
 CORS(app)
-# 配置 Celery
-app.config['CELERY_BROKER_URL'] = 'redis://localhost:6379/0'
-app.config['CELERY_RESULT_BACKEND'] = 'redis://localhost:6379/0'
 
-celery = Celery(app.name, broker=app.config['CELERY_BROKER_URL'])
+app.config["CELERY_BROKER_URL"] = "redis://localhost:6379/0"
+app.config["CELERY_RESULT_BACKEND"] = "redis://localhost:6379/0"
+
+celery = Celery(app.name, broker=app.config["CELERY_BROKER_URL"])
 celery.conf.update(app.config)
 
-# 初始化瓦片服务
-tiler_service = TilerService(data_dir='./storage')
+tiler_service = TilerService(data_dir=COG_DIR)
 
-@app.route('/api/v1/analysis', methods=['POST'])
+
+def _load_gdf_from_upload(file_storage) -> gpd.GeoDataFrame:
+    """Load uploaded AOI file (zip shp or geojson) into a GeoDataFrame."""
+    filename = (file_storage.filename or "").lower()
+    if not filename:
+        raise ValueError("Missing filename")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        if filename.endswith(".zip"):
+            tmp_zip = tmpdir_path / filename
+            file_storage.save(tmp_zip)
+            extract_dir = tmpdir_path / "unzipped"
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(tmp_zip, "r") as zf:
+                zf.extractall(extract_dir)
+            shapefiles = list(extract_dir.rglob("*.shp"))
+            if not shapefiles:
+                raise ValueError("No .shp found inside zip")
+            gdf = gpd.read_file(shapefiles[0])
+        elif filename.endswith(".geojson") or filename.endswith(".json"):
+            tmp_geojson = tmpdir_path / filename
+            file_storage.save(tmp_geojson)
+            gdf = gpd.read_file(tmp_geojson)
+        else:
+            raise ValueError("Unsupported file type. Use zip (SHP) or GeoJSON.")
+
+    if gdf.empty:
+        raise ValueError("AOI file contains no features")
+    return gdf
+
+
+@app.route("/api/v1/aoi/upload", methods=["POST"])
+def upload_aoi():
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"error": "Missing file"}), 400
+
+    try:
+        gdf = _load_gdf_from_upload(file)
+        if gdf.crs is None:
+            gdf = gdf.set_crs("EPSG:4326")
+        gdf_4326 = gdf.to_crs("EPSG:4326")
+
+        area_km2 = float(gdf_4326.to_crs("EPSG:3857").area.sum() / 1e6)
+        if area_km2 > 100:
+            return jsonify({"error": "AOI area exceeds 100 km²", "area_km2": area_km2}), 400
+
+        aoi_geojson = json.loads(gdf_4326.to_json())
+        aoi_id = str(uuid.uuid4())
+        AOI_DIR.mkdir(parents=True, exist_ok=True)
+        with open(AOI_DIR / f"{aoi_id}.geojson", "w", encoding="utf-8") as f:
+            json.dump(aoi_geojson, f)
+
+        return jsonify({"aoi_id": aoi_id, "geojson": aoi_geojson, "area_km2": area_km2}), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Failed to process AOI: {e}"}), 500
+
+
+@app.route("/api/v1/analysis", methods=["POST"])
 def trigger_analysis():
-    """
-    触发新分析任务
-    Payload: { "aoi": {geojson_geometry}, "date_range": ["2023-01-01", "2023-06-01"] }
-    """
-    data = request.json
-    if not data or 'aoi' not in data:
-        return jsonify({"error": "Missing AOI data"}), 400
+    data = request.get_json(silent=True) or {}
+    required = ["aoi_id", "start", "end"]
+    if any(field not in data for field in required):
+        return jsonify({"error": "aoi_id, start, end are required"}), 400
 
-    # 启动异步任务
-    task = tasks.run_full_pipeline.apply_async(args=[data])
-    
-    return jsonify({
-        "job_id": task.id,
-        "status": "processing",
-        "message": "Analysis pipeline started"
-    }), 202
+    aoi_path = AOI_DIR / f"{data['aoi_id']}.geojson"
+    if not aoi_path.exists():
+        return jsonify({"error": "AOI not found"}), 404
 
-@app.route('/api/v1/analysis/<job_id>', methods=['GET'])
+    payload = {
+        "aoi_id": data["aoi_id"],
+        "start": data["start"],
+        "end": data["end"],
+        "layers": data.get("layers", ["ndvi", "biomass", "carbon"]),
+    }
+
+    task = tasks.run_pipeline.apply_async(args=[payload])
+    return jsonify({"job_id": task.id, "status": "processing", "message": "Analysis pipeline started"}), 202
+
+
+@app.route("/api/v1/analysis/<job_id>", methods=["GET"])
 def get_analysis_status(job_id):
-    """查询任务状态和结果"""
-    task = tasks.run_full_pipeline.AsyncResult(job_id)
-    
-    if task.state == 'PENDING':
+    task = tasks.run_pipeline.AsyncResult(job_id)
+
+    if task.state == "PENDING":
         response = {"state": "PENDING", "status": "Task is waiting for execution"}
-    elif task.state == 'STARTED':
+    elif task.state == "STARTED":
         response = {"state": "STARTED", "status": "Task is currently running"}
-    elif task.state == 'SUCCESS':
-        response = {
-            "state": "SUCCESS", 
-            "result": task.result  # 包含 layers 的 tile_url
-        }
-    elif task.state == 'FAILURE':
+    elif task.state == "SUCCESS":
+        response = {"state": "SUCCESS", "result": task.result}
+    elif task.state == "FAILURE":
         response = {"state": "FAILURE", "error": str(task.info)}
     else:
         response = {"state": task.state}
-        
+
     return jsonify(response)
 
-@app.route('/api/v1/tiles/<job_id>/<layer>/<int:z>/<int:x>/<int:y>.png', methods=['GET'])
-def get_tile(job_id, layer, z, x, y):
-    """
-    返回瓦片
-    layer: 'ndvi', 'biomass', 'carbon'
-    job_id: 任务ID (对应存储目录)
-    """
+
+@app.route("/tiles/<layer>/<job_id>/<int:z>/<int:x>/<int:y>.png", methods=["GET"])
+def get_tile(layer, job_id, z, x, y):
     try:
-        # 获取瓦片二进制数据
         tile_data = tiler_service.get_tile(job_id, layer, z, x, y)
         if tile_data:
-            return Response(tile_data, mimetype='image/png')
-        else:
-            return jsonify({"error": "Tile generation failed"}), 404
+            return Response(tile_data, mimetype="image/png")
+        return jsonify({"error": "Tile generation failed"}), 404
     except FileNotFoundError:
         return jsonify({"error": "Layer not found"}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-if __name__ == '__main__':
-    # 确保存储目录存在
-    os.makedirs('./storage', exist_ok=True)
+
+if __name__ == "__main__":
+    COG_DIR.mkdir(parents=True, exist_ok=True)
+    AOI_DIR.mkdir(parents=True, exist_ok=True)
     app.run(debug=True, port=5000)
